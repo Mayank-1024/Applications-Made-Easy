@@ -1,0 +1,988 @@
+{
+  "name": "Applications made easy",
+  "nodes": [
+    {
+      "id": "f8e8363e-dc88-4d27-a43c-fb27b5a6e4ce",
+      "name": "Note: Trigger & Config",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1380,
+        -160
+      ],
+      "parameters": {
+        "content": "## ① Trigger, config, read-before-write\nRuns **every 3 days at 09:00** (workflow timezone: America/New_York).\n\n**Build Config is the node you edit** for role filter groups, location lists, company boards, caps and max age. The Google Sheet itself is picked on the three Sheets nodes.\n\n**Read Applications** happens *before* any fetching. **Index Existing Rows** collapses it to one item: links already saved, next `s.no`, row count. A failed read **stops the run** on purpose. Carrying on with an empty dedupe set would re-append everything.",
+        "width": 900,
+        "height": 1380,
+        "color": 7
+      }
+    },
+    {
+      "id": "c893b899-c001-47c2-a286-01f4cdf3b7df",
+      "name": "Note: Company boards",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        -160
+      ],
+      "parameters": {
+        "content": "## ②a Company career boards (highest signal)\nGreenhouse, Ashby and Lever expose each company's job board as public JSON. No key, no scraping. One request per company.\n\nAdd a company in **Build Config → GREENHOUSE_BOARDS / ASHBY_BOARDS / LEVER_BOARDS**. Verify the token in a browser first (URL patterns are in the config comments).\n\nEach HTTP node retries 3× (2 s apart) and **continues on error**. A dead board shows up in the Run Log as e.g. `Benchling (Ashby, empty)`.",
+        "width": 700,
+        "height": 700,
+        "color": 4
+      }
+    },
+    {
+      "id": "d4842447-532f-4264-afb8-5a0239e198cd",
+      "name": "Note: Aggregate boards",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        580
+      ],
+      "parameters": {
+        "content": "## ②b Aggregate remote boards (broad, lower signal)\nRemotive, RemoteOK, Jobicy (`geo=usa`). Free and keyless. All three require a link back to them, and the sheet stores their own URLs.\n\nSame resilience: 3 retries, continue on error, and dead sources are named in the Run Log.\n\nNothing to edit here day to day.",
+        "width": 700,
+        "height": 640,
+        "color": 5
+      }
+    },
+    {
+      "id": "565d2934-194a-4acc-a4c7-3b1b917f9f33",
+      "name": "Note: Normalize",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        320,
+        -160
+      ],
+      "parameters": {
+        "content": "## ③ Merge + normalize\nSix shapes in, one shape out:\n`tier, board, source, company, title, url, description, posted_date, location`\n\n- HTML stripped, entities decoded twice (Greenhouse double-encodes)\n- Dates: ISO / \"YYYY-MM-DD HH:mm:ss\" / unix s / unix ms → `YYYY-MM-DD`\n\nNothing to edit here.",
+        "width": 460,
+        "height": 1380,
+        "color": 6
+      }
+    },
+    {
+      "id": "c9ab5d71-d721-4513-a55d-c5b67e63280f",
+      "name": "Note: Filter",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        820,
+        -160
+      ],
+      "parameters": {
+        "content": "## ④ Filter, rank, cap\nrequired fields → description length → valid date → age (aggregates only) → role → location → dupes in run → dupes in Applications\n\nThen: company boards first, newest first, ≤15 per company, ≤100 per run.\n\nEmits **one** item `{rows, stats}` so a zero-match run still flows on to the Run Log. `stats.dropped` in the output shows the breakdown by reason.\n\nTune behaviour in **Build Config**, not here.",
+        "width": 460,
+        "height": 1380,
+        "color": 3
+      }
+    },
+    {
+      "id": "99b9965a-f8ee-49ce-a190-ab06c24ab3d0",
+      "name": "Note: Output",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        -160
+      ],
+      "parameters": {
+        "content": "## ⑤ Write to the sheet\n**Applications**: one row per new job. Columns must match the header row exactly (lowercase).\n**Run Log**: one row per run, **always written**, including runs with zero new jobs.\n\n`rows appended` counts what Google actually accepted. A failed append is written into `dead sources` instead of killing the log.",
+        "width": 960,
+        "height": 1380,
+        "color": 2
+      }
+    },
+    {
+      "id": "5464f8a1-f185-4576-a17a-cc82ef65d9d4",
+      "name": "Every 3 Days",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1300,
+        520
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 3,
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "742fc22e-d6f3-4b7e-ad37-6afcdae36ab7",
+      "name": "Build Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1080,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// ===================================================================\n//  CONTROL PANEL - the only node you should need to edit.\n//  Everything below is data: adding a role, a company or a location\n//  means editing an array, never the filter logic downstream.\n// ===================================================================\n\n// The Google Sheet (document + tab) is set directly on the three Sheets\n// nodes - Read Applications, Append to Applications, Append to Run Log -\n// not here. The n8n editor clears a tab chosen by expression whenever the\n// node is opened, so those fields must hold fixed values.\n\n// --- 1. ROLE FILTERS -------------------------------------------------\n// A job is kept if it matches ANY group. Inside a group it must hit one\n// 'include' term and no 'exclude' term. Terms match whole words\n// (case-insensitive, optional trailing \"s\"), so 'intern' does not match\n// \"internal\" and 'llm' does match \"LLMs\".\n// Groups are tried in order; the first match becomes 'matched filter'.\nconst FILTERS = [\n  {\n    name: 'AI / ML Engineer',\n    include: ['ai engineer', 'ml engineer', 'machine learning', 'llm', 'genai', 'generative ai', 'ai/ml',\n              'applied scientist', 'ai infrastructure'],\n    exclude: ['intern', 'internship', 'unpaid', 'principal', 'director', 'vp', 'head of']\n  },\n  {\n    name: 'Software Developer',\n    include: ['software engineer', 'software developer', 'full stack', 'fullstack', 'full-stack', 'backend',\n              'back end', 'frontend', 'front end', 'platform engineer'],\n    exclude: ['intern', 'internship', 'principal', 'director', 'vp', 'head of', 'engineering manager']\n  },\n  {\n    name: 'Automation / Solutions',\n    include: ['automation engineer', 'integration engineer', 'solutions engineer', 'solutions architect',\n              'forward deployed', 'technical account manager', 'sales engineer', 'implementation engineer'],\n    exclude: ['intern', 'internship', 'account executive', 'director', 'vp', 'head of']\n  }\n];\n\n// --- 2. LOCATION RULES -----------------------------------------------\n// A location string is split into segments on ; | • and \" or \", because\n// boards list multi-city roles as \"San Francisco, CA; London, UK\". The job\n// passes if ANY segment passes. Per segment, in this order:\n//   a) mentions a term in LOCATION_US_EXPLICIT        -> pass (beats block)\n//   b) mentions a term in LOCATION_BLOCK              -> fail\n//   c) mentions LOCATION_ALLOW or \", <state code>\"    -> pass\n// Explicit-US beats block so \"USA, UK, India\" (Remotive's list of where\n// candidates may live) still passes for a US resident.\n// An empty location passes - several boards omit it on remote-only roles.\nconst LOCATION_US_EXPLICIT = [\n  'united states', 'usa', 'u.s.', 'u.s.a.', 'us', 'north america', 'northern america', 'americas'\n];\nconst LOCATION_BLOCK = [\n  // regions\n  'emea', 'europe', 'apac', 'latam', 'latin america', 'asia', 'africa', 'oceania', 'middle east',\n  // countries\n  'canada', 'mexico', 'brazil', 'argentina', 'colombia', 'chile', 'peru', 'uk', 'united kingdom', 'england',\n  'ireland', 'germany', 'france', 'spain', 'portugal', 'italy', 'netherlands', 'belgium', 'switzerland',\n  'austria', 'poland', 'ukraine', 'romania', 'serbia', 'sweden', 'norway', 'denmark', 'finland', 'israel',\n  'india', 'pakistan', 'philippines', 'singapore', 'japan', 'korea', 'south korea', 'china', 'taiwan',\n  'vietnam', 'indonesia', 'australia', 'new zealand', 'nigeria', 'kenya', 'south africa', 'turkey', 'uae',\n  // big non-US tech cities that often appear without a country\n  'london', 'dublin', 'paris', 'berlin', 'munich', 'amsterdam', 'zurich', 'zürich', 'stockholm', 'warsaw',\n  'krakow', 'belgrade', 'tel aviv', 'toronto', 'vancouver', 'montreal', 'bengaluru', 'bangalore', 'mumbai',\n  'hyderabad', 'pune', 'delhi', 'tokyo', 'seoul', 'sydney', 'melbourne', 'sao paulo', 'são paulo'\n];\nconst LOCATION_ALLOW = [\n  'remote', 'anywhere', 'worldwide',\n  // US states (names)\n  'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut', 'delaware', 'florida',\n  'georgia', 'hawaii', 'idaho', 'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine',\n  'maryland', 'massachusetts', 'michigan', 'minnesota', 'mississippi', 'missouri', 'montana', 'nebraska',\n  'nevada', 'new hampshire', 'new jersey', 'new mexico', 'new york', 'north carolina', 'north dakota', 'ohio',\n  'oklahoma', 'oregon', 'pennsylvania', 'rhode island', 'south carolina', 'south dakota', 'tennessee', 'texas',\n  'utah', 'vermont', 'virginia', 'washington', 'west virginia', 'wisconsin', 'wyoming', 'district of columbia',\n  // US metros that boards print without a state\n  'san francisco', 'bay area', 'silicon valley', 'nyc', 'boston', 'seattle', 'austin', 'chicago', 'los angeles',\n  'denver', 'atlanta', 'miami', 'palo alto', 'mountain view', 'menlo park', 'sunnyvale', 'san jose', 'san mateo',\n  'redwood city', 'san diego', 'bellevue', 'pittsburgh', 'philadelphia', 'washington dc', 'washington, d.c.',\n  'salt lake city', 'portland', 'dallas', 'houston', 'raleigh', 'detroit', 'minneapolis', 'nashville', 'phoenix'\n];\n// Matched case-sensitively as \", XX\" - \"Boston, MA\", \"Austin, TX\".\nconst US_STATE_CODES = [\n  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA',\n  'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK',\n  'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'\n];\n\n// --- 3. COMPANY CAREER BOARDS ----------------------------------------\n// Highest-signal sources: each company's own ATS, public and keyless.\n// Verify a token before adding it - paste the URL into a browser:\n//   Greenhouse  boards-api.greenhouse.io/v1/boards/<token>/jobs\n//   Ashby       api.ashbyhq.com/posting-api/job-board/<board>\n//   Lever       api.lever.co/v0/postings/<slug>?mode=json\n// JSON with jobs in it = good. 404 or an empty list = wrong token.\n// An empty array disables that ATS family.\nconst GREENHOUSE_BOARDS = [\n  { company: 'Anthropic',  token: 'anthropic'  },\n  { company: 'Databricks', token: 'databricks' },\n  { company: 'Figma',      token: 'figma'      },\n  { company: 'Discord',    token: 'discord'    },\n  { company: 'Klaviyo',    token: 'klaviyo'    },\n  { company: 'Robinhood',  token: 'robinhood'  }\n];\nconst ASHBY_BOARDS = [\n  { company: 'OpenAI',    board: 'openai'    },\n  { company: 'n8n',       board: 'n8n'       },\n  { company: 'Ramp',      board: 'ramp'      },\n  { company: 'Linear',    board: 'linear'    },\n  { company: 'Vanta',     board: 'vanta'     },\n  { company: 'Benchling', board: 'benchling' }\n];\nconst LEVER_BOARDS = [\n  { company: 'Palantir', slug: 'palantir' }\n];\n\n// --- 4. RUN SETTINGS -------------------------------------------------\nconst MAX_RESULTS          = 100;     // hard cap on rows appended per run\nconst MAX_PER_COMPANY      = 15;      // stops one big board taking every slot; extras roll to later runs\nconst MIN_AGGREGATE_SLOTS  = 0;       // reserve N of MAX_RESULTS for aggregate boards (0 = strict ranking)\nconst MATCH_IN             = 'title'; // 'title' (precise) | 'title_and_description' (wider, noisier)\nconst MAX_AGE_DAYS = {\n  company:   null,  // null = no limit: a live ATS listing is an open role, whatever its first-posted date\n  aggregate: 30     // aggregate boards keep stale listings around, so age them out\n};\nconst MIN_DESC_LEN   = 40;    // drop listings whose description is basically empty\nconst DESC_MAX_CHARS = 900;   // description is trimmed to this for the sheet\n\n// Query parameters that identify a posting and must survive URL\n// normalisation. Everything else (utm_*, gh_src, ref...) is tracking and\n// is stripped. Databricks serves all 886 jobs from one path and tells\n// them apart only by ?gh_jid=, so stripping the whole query is not safe.\nconst URL_ID_PARAMS = ['gh_jid', 'jobid', 'job_id', 'jid', 'id', 'posting_id', 'postingid', 'reqid', 'req_id'];\n// ===================================================================\n\n\nconsole.log(`[config] ${FILTERS.length} role groups | boards: ${GREENHOUSE_BOARDS.length} Greenhouse, ` +\n            `${ASHBY_BOARDS.length} Ashby, ${LEVER_BOARDS.length} Lever | cap ${MAX_RESULTS}/run, ` +\n            `${MAX_PER_COMPANY}/company`);\n\nreturn [{\n  json: {\n    filters: FILTERS,\n    location_us_explicit: LOCATION_US_EXPLICIT,\n    location_block: LOCATION_BLOCK,\n    location_allow: LOCATION_ALLOW,\n    us_state_codes: US_STATE_CODES,\n    greenhouse_boards: GREENHOUSE_BOARDS,\n    ashby_boards: ASHBY_BOARDS,\n    lever_boards: LEVER_BOARDS,\n    max_results: MAX_RESULTS,\n    max_per_company: MAX_PER_COMPANY,\n    min_aggregate_slots: MIN_AGGREGATE_SLOTS,\n    match_in: MATCH_IN,\n    max_age_days: MAX_AGE_DAYS,\n    min_desc_len: MIN_DESC_LEN,\n    desc_max_chars: DESC_MAX_CHARS,\n    url_id_params: URL_ID_PARAMS,\n    // Local wall-clock time in the workflow's timezone, so 'added on' is the\n    // date you'd expect rather than a UTC date that can be a day off.\n    run_at: $now.toFormat('yyyy-MM-dd HH:mm ZZZZ'),\n    run_date: $now.toFormat('yyyy-MM-dd')\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "15efc9ef-6265-40ff-a514-0de9d2193895",
+      "name": "Read Applications",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -860,
+        520
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Applications"
+        },
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "4f55e033-fa6a-4455-a194-636119b3f2c7",
+      "name": "Index Existing Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Collapse the Applications tab into one item: the links already saved, the next serial\n// number and the row count. Two reasons this exists as its own node:\n//  1. Read Applications emits one item per row; without collapsing, every source\n//     branch downstream would fire once per existing row.\n//  2. Raw links are passed on untouched. URL normalisation happens in one\n//     place only (Filter, Rank & Cap) so the sheet side and the new-job side\n//     can never drift apart and silently break dedupe.\n//\n// Read Applications has \"Always Output Data\" on, so an empty sheet arrives here as\n// a single {} item rather than stopping the workflow.\n\nconst rows = $input.all().map(i => i.json).filter(r => r && Object.keys(r).length > 0);\n\n// Header lookup is case-insensitive so a \"Job Posting Link\" header still\n// dedupes - but the append side needs exact lowercase headers anyway.\nconst pick = (row, name) => {\n  const key = Object.keys(row).find(k => k.trim().toLowerCase() === name);\n  return key === undefined ? undefined : row[key];\n};\n\nconst links = [];\nlet maxSno = 0;\nfor (const row of rows) {\n  const link = pick(row, 'job posting link');\n  if (link) links.push(String(link));\n  const n = parseInt(pick(row, 's.no'), 10);\n  if (!isNaN(n) && n > maxSno) maxSno = n;\n}\n\nconsole.log(`[sheet] ${rows.length} existing rows | ${links.length} links | next s.no ${maxSno + 1}`);\n\nreturn [{ json: { existing_links: links, existing_row_count: rows.length, next_sno: maxSno + 1 } }];\n"
+      }
+    },
+    {
+      "id": "8a253afb-7914-468f-a38a-c58301a5d7c3",
+      "name": "Greenhouse Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Fan out one item per Greenhouse board so the HTTP node makes one request\n// per company. If the list is empty this returns nothing; \"Always Output\n// Data\" then sends a single empty item, the request 404s harmlessly, and Map\n// Greenhouse reports the family as disabled. That keeps every Merge input\n// fed, so the Merge never waits on a branch that didn't run.\nconst boards = $('Build Config').first().json.greenhouse_boards ?? [];\nconsole.log(`[greenhouse] requesting ${boards.length} boards`);\nreturn boards.map(b => ({ json: { company: b.company, token: b.token } }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "53126ef9-ca45-462b-a24a-7d0147433009",
+      "name": "Greenhouse Boards",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        20
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "=https://boards-api.greenhouse.io/v1/boards/{{ $json.token }}/jobs?content=true"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "02d5505e-68cf-44fc-a3f7-64f89a0a8f90",
+      "name": "Map Greenhouse",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Greenhouse -> unified job shape. Pure field mapping: HTML stripping and\n// date normalisation happen once, in Normalize Jobs, for every source alike.\n//\n// Each response is tied back to its company through paired items\n// (itemMatching) rather than array position, so a failed request can't shift\n// every later company onto the wrong jobs.\nconst SOURCE = 'Greenhouse';\nconst configured = $('Build Config').first().json.greenhouse_boards ?? [];\n\nif (!configured.length) {\n  console.log(`[${SOURCE}] disabled (empty board list)`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company', status: 'disabled', count: 0, boards: [] } }];\n}\n\n// Pull a short, human-readable failure reason out of an n8n error item.\nconst failReason = (err) => {\n  const msg = typeof err === 'string' ? err : (err?.message ?? JSON.stringify(err ?? ''));\n  const code = err?.httpCode ?? err?.status ?? (String(msg).match(/\\b[45]\\d\\d\\b/) ?? [])[0];\n  return code ? `HTTP ${code}` : String(msg).slice(0, 60);\n};\n\n// itemMatching throws when an item has no pairing - which is the case for\n// the placeholder {} that \"Always Output Data\" emits when every board\n// came back empty. Treat that as \"no target\" rather than crashing.\nconst targetFor = (idx) => {\n  try { return $('Greenhouse Targets').itemMatching(idx)?.json ?? {}; } catch { return {}; }\n};\n\n// Seeded from config so a board that got no response at all still shows as dead.\nconst boards = new Map(configured.map(c => [c.company, { company: c.company, status: 'dead', jobs: 0, reason: 'no response' }]));\nconst out = [];\n\n$input.all().forEach((item, idx) => {\n  const target = targetFor(idx);\n  if (!target.company) return;                    // unpaired placeholder item\n  const company = target.company;\n  const res = item.json ?? {};\n  const b = boards.get(company) ?? { company, status: 'dead', jobs: 0, reason: 'no response' };\n  boards.set(company, b);\n\n  if (res.error) { b.status = 'dead'; b.reason = failReason(res.error); return; }\n  const jobs = Array.isArray(res.jobs) ? res.jobs : [];\n  if (!jobs.length) { b.status = 'dead'; b.reason = 'empty'; return; }\n  b.status = 'ok'; b.reason = '';\n\n  for (const j of jobs) {\n    b.jobs++;\n    out.push({ json: {\n      _kind: 'job', tier: 'company', board: SOURCE, source: `${SOURCE}: ${company}`, company,\n      title: j.title ?? '',\n      url: j.absolute_url ?? '',\n      description_raw: j.content ?? '',          // entity-encoded HTML; decoded downstream\n      posted_raw: j.first_published ?? j.updated_at ?? '',\n      location: j.location?.name ?? ''\n    }});\n  }\n});\n\nconst list = [...boards.values()];\nconst ok = list.filter(b => b.status === 'ok');\nconst dead = list.filter(b => b.status !== 'ok');\nconsole.log(`[${SOURCE}] ${ok.length}/${list.length} boards ok, ${out.length} jobs` +\n            (dead.length ? ` | dead: ${dead.map(b => `${b.company} (${b.reason})`).join(', ')}` : ''));\n\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company',\n                  status: ok.length ? 'ok' : 'unavailable', count: out.length, boards: list } }, ...out];\n"
+      }
+    },
+    {
+      "id": "38d89d1c-632e-45c4-a5b1-1a8396da3c08",
+      "name": "Ashby Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Fan out one item per Ashby board (see Greenhouse Targets for why an empty\n// list is safe).\nconst boards = $('Build Config').first().json.ashby_boards ?? [];\nconsole.log(`[ashby] requesting ${boards.length} boards`);\nreturn boards.map(b => ({ json: { company: b.company, board: b.board } }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "8d7e1f69-4720-46fe-a9e7-de93a380b204",
+      "name": "Ashby Boards",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        220
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "=https://api.ashbyhq.com/posting-api/job-board/{{ $json.board }}?includeCompensation=false"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "0073f83b-f44d-4300-a162-49feedb4d763",
+      "name": "Map Ashby",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Ashby -> unified job shape. Pure field mapping (see Map Greenhouse for the\n// paired-item reasoning).\nconst SOURCE = 'Ashby';\nconst configured = $('Build Config').first().json.ashby_boards ?? [];\n\nif (!configured.length) {\n  console.log(`[${SOURCE}] disabled (empty board list)`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company', status: 'disabled', count: 0, boards: [] } }];\n}\n\nconst failReason = (err) => {\n  const msg = typeof err === 'string' ? err : (err?.message ?? JSON.stringify(err ?? ''));\n  const code = err?.httpCode ?? err?.status ?? (String(msg).match(/\\b[45]\\d\\d\\b/) ?? [])[0];\n  return code ? `HTTP ${code}` : String(msg).slice(0, 60);\n};\n\n// itemMatching throws when an item has no pairing - which is the case for\n// the placeholder {} that \"Always Output Data\" emits when every board\n// came back empty. Treat that as \"no target\" rather than crashing.\nconst targetFor = (idx) => {\n  try { return $('Ashby Targets').itemMatching(idx)?.json ?? {}; } catch { return {}; }\n};\n\n// Seeded from config so a board that got no response at all still shows as dead.\nconst boards = new Map(configured.map(c => [c.company, { company: c.company, status: 'dead', jobs: 0, reason: 'no response' }]));\nconst out = [];\n\n$input.all().forEach((item, idx) => {\n  const target = targetFor(idx);\n  if (!target.company) return;                    // unpaired placeholder item\n  const company = target.company;\n  const res = item.json ?? {};\n  const b = boards.get(company) ?? { company, status: 'dead', jobs: 0, reason: 'no response' };\n  boards.set(company, b);\n\n  if (res.error) { b.status = 'dead'; b.reason = failReason(res.error); return; }\n  // Ashby answers 200 with an empty list for unknown boards, so \"empty\"\n  // is the only signal that a board name is wrong.\n  const jobs = (Array.isArray(res.jobs) ? res.jobs : []).filter(j => j.isListed !== false);\n  if (!jobs.length) { b.status = 'dead'; b.reason = 'empty'; return; }\n  b.status = 'ok'; b.reason = '';\n\n  for (const j of jobs) {\n    b.jobs++;\n    // Ashby lists the main office plus \"secondaryLocations\"; keep them all so\n    // a role that's NYC-or-Remote-US isn't judged on NYC alone.\n    const extra = (j.secondaryLocations ?? []).map(l => l?.location ?? l).filter(Boolean);\n    const locs = [j.location, ...extra].filter(Boolean);\n    if (j.isRemote && !locs.some(l => /remote/i.test(l))) locs.push('Remote');\n    out.push({ json: {\n      _kind: 'job', tier: 'company', board: SOURCE, source: `${SOURCE}: ${company}`, company,\n      title: j.title ?? '',\n      url: j.jobUrl ?? j.applyUrl ?? '',\n      description_raw: j.descriptionPlain || j.descriptionHtml || '',\n      posted_raw: j.publishedAt ?? '',\n      location: locs.join(' | ')\n    }});\n  }\n});\n\nconst list = [...boards.values()];\nconst ok = list.filter(b => b.status === 'ok');\nconst dead = list.filter(b => b.status !== 'ok');\nconsole.log(`[${SOURCE}] ${ok.length}/${list.length} boards ok, ${out.length} jobs` +\n            (dead.length ? ` | dead: ${dead.map(b => `${b.company} (${b.reason})`).join(', ')}` : ''));\n\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company',\n                  status: ok.length ? 'ok' : 'unavailable', count: out.length, boards: list } }, ...out];\n"
+      }
+    },
+    {
+      "id": "cc19c08f-cdaf-480b-a4d5-62ed8fe9a500",
+      "name": "Lever Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Fan out one item per Lever board (see Greenhouse Targets for why an empty\n// list is safe).\nconst boards = $('Build Config').first().json.lever_boards ?? [];\nconsole.log(`[lever] requesting ${boards.length} boards`);\nreturn boards.map(b => ({ json: { company: b.company, slug: b.slug } }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "78916431-1b22-455e-a7a5-eb7e12d599cd",
+      "name": "Lever Boards",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        420
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "=https://api.lever.co/v0/postings/{{ $json.slug }}?mode=json"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "f11b7ff0-e0a6-4baa-ae17-283ec60a16dd",
+      "name": "Map Lever",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Lever -> unified job shape. Lever returns a bare array, which the HTTP node\n// splits into one item per posting - so a board yields many items, all paired\n// back to the same Lever Targets item. A board that returns [] yields no items\n// at all, which is why boards are seeded from the target list first.\nconst SOURCE = 'Lever';\nconst configured = $('Build Config').first().json.lever_boards ?? [];\n\nif (!configured.length) {\n  console.log(`[${SOURCE}] disabled (empty board list)`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company', status: 'disabled', count: 0, boards: [] } }];\n}\n\nconst failReason = (err) => {\n  const msg = typeof err === 'string' ? err : (err?.message ?? JSON.stringify(err ?? ''));\n  const code = err?.httpCode ?? err?.status ?? (String(msg).match(/\\b[45]\\d\\d\\b/) ?? [])[0];\n  return code ? `HTTP ${code}` : String(msg).slice(0, 60);\n};\n\n// itemMatching throws when an item has no pairing - which is the case for\n// the placeholder {} that \"Always Output Data\" emits when every board\n// came back empty. Treat that as \"no target\" rather than crashing.\nconst targetFor = (idx) => {\n  try { return $('Lever Targets').itemMatching(idx)?.json ?? {}; } catch { return {}; }\n};\n\nconst boards = new Map(configured.map(c => [c.company, { company: c.company, status: 'dead', jobs: 0, reason: 'empty' }]));\nconst out = [];\n\n$input.all().forEach((item, idx) => {\n  const target = targetFor(idx);\n  if (!target.company) return;                    // unpaired placeholder item\n  const company = target.company;\n  const j = item.json ?? {};\n  const b = boards.get(company) ?? { company, status: 'dead', jobs: 0, reason: 'empty' };\n  boards.set(company, b);\n\n  if (j.error) { if (!b.jobs) { b.status = 'dead'; b.reason = failReason(j.error); } return; }\n  if (!j.text || !j.hostedUrl) return;\n\n  b.status = 'ok'; b.reason = ''; b.jobs++;\n  // The plain description omits the requirement lists, which is where most\n  // of the substance is - append them so the description check is fair.\n  const lists = (j.lists ?? []).map(l => `${l.text ?? ''}: ${l.content ?? ''}`).join(' ');\n  const locs = j.categories?.allLocations?.length ? j.categories.allLocations : [j.categories?.location].filter(Boolean);\n  if (j.workplaceType === 'remote' && !locs.some(l => /remote/i.test(l))) locs.push('Remote');\n  out.push({ json: {\n    _kind: 'job', tier: 'company', board: SOURCE, source: `${SOURCE}: ${company}`, company,\n    title: j.text,\n    url: j.hostedUrl,\n    description_raw: `${j.descriptionPlain ?? ''} ${lists} ${j.additionalPlain ?? ''}`,\n    posted_raw: j.createdAt ?? '',               // unix milliseconds (as a string)\n    location: locs.join(' | ')\n  }});\n});\n\nconst list = [...boards.values()];\nconst ok = list.filter(b => b.status === 'ok');\nconst dead = list.filter(b => b.status !== 'ok');\nconsole.log(`[${SOURCE}] ${ok.length}/${list.length} boards ok, ${out.length} jobs` +\n            (dead.length ? ` | dead: ${dead.map(b => `${b.company} (${b.reason})`).join(', ')}` : ''));\n\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'company',\n                  status: ok.length ? 'ok' : 'unavailable', count: out.length, boards: list } }, ...out];\n"
+      }
+    },
+    {
+      "id": "0ef3f839-66a1-4b5e-addf-0f4e8b1137d6",
+      "name": "Remotive API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        700
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "https://remotive.com/api/remote-jobs",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "ea53307b-b4d1-4d79-a1de-f7385b0ecf1b",
+      "name": "Map Remotive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        700
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Remotive -> unified job shape. Remotive's free feed is delayed 24h and\n// asks for at most 4 calls a day; every 3 days is well inside that.\nconst SOURCE = 'Remotive';\nconst res = $input.first()?.json ?? {};\nconst jobs = Array.isArray(res.jobs) ? res.jobs : [];\n\nif (res.error || !jobs.length) {\n  console.log(`[${SOURCE}] unavailable${res.error ? ' (request failed)' : ' (no jobs in response)'}`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'unavailable', count: 0 } }];\n}\n\nconst out = jobs.map(j => ({ json: {\n  _kind: 'job', tier: 'aggregate', board: SOURCE, source: SOURCE,\n  company: j.company_name ?? '',\n  title: j.title ?? '',\n  url: j.url ?? '',                               // remotive.com link - satisfies their link-back term\n  description_raw: j.description ?? '',\n  posted_raw: j.publication_date ?? '',\n  location: j.candidate_required_location ?? ''\n}}));\n\nconsole.log(`[${SOURCE}] ${out.length} jobs`);\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'ok', count: out.length } }, ...out];\n"
+      }
+    },
+    {
+      "id": "2e347844-8fe7-4387-a8a9-3021052468a0",
+      "name": "RemoteOK API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        880
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "https://remoteok.com/api",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "ApplicationsMadeEasy/1.0 (personal job search; n8n)"
+            }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "08d1b14e-cb9c-41b9-a0da-082b88d81d40",
+      "name": "Map RemoteOK",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// RemoteOK -> unified job shape. The API returns a bare array that the HTTP\n// node splits into items; the first element is a legal notice, not a job,\n// so anything carrying a 'legal' field or lacking a position is skipped.\nconst SOURCE = 'RemoteOK';\nconst items = $input.all().map(i => i.json ?? {});\nconst failed = items.length === 1 && items[0].error;\nconst jobs = items.filter(j => !j.legal && !j.error && (j.position || j.title));\n\nif (failed || !jobs.length) {\n  console.log(`[${SOURCE}] unavailable${failed ? ' (request failed)' : ' (no jobs in response)'}`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'unavailable', count: 0 } }];\n}\n\nconst out = jobs.map(j => ({ json: {\n  _kind: 'job', tier: 'aggregate', board: SOURCE, source: SOURCE,\n  company: j.company ?? '',\n  title: j.position ?? j.title ?? '',\n  url: j.url ?? j.apply_url ?? '',                // remoteok.com link - satisfies their link-back term\n  description_raw: j.description ?? '',\n  posted_raw: j.date ?? j.epoch ?? '',            // ISO string, with unix seconds as fallback\n  location: j.location ?? ''                      // often blank; blank locations pass the filter\n}}));\n\nconsole.log(`[${SOURCE}] ${out.length} jobs`);\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'ok', count: out.length } }, ...out];\n"
+      }
+    },
+    {
+      "id": "80c6fdc9-63fc-46af-a798-348f244df953",
+      "name": "Jobicy API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        1060
+      ],
+      "parameters": {
+        "method": "GET",
+        "options": {
+          "timeout": 30000
+        },
+        "url": "https://jobicy.com/api/v2/remote-jobs",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "count",
+              "value": "100"
+            },
+            {
+              "name": "geo",
+              "value": "usa"
+            }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "e2dfe88c-36b5-42d0-ac38-1892e112a212",
+      "name": "Map Jobicy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        1060
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Jobicy -> unified job shape. The request already asks for geo=usa, so this\n// board is pre-filtered server-side; the location rules still run on it.\nconst SOURCE = 'Jobicy';\nconst res = $input.first()?.json ?? {};\nconst jobs = Array.isArray(res.jobs) ? res.jobs : [];\n\nif (res.error || !jobs.length) {\n  console.log(`[${SOURCE}] unavailable${res.error ? ' (request failed)' : ' (no jobs in response)'}`);\n  return [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'unavailable', count: 0 } }];\n}\n\nconst out = jobs.map(j => ({ json: {\n  _kind: 'job', tier: 'aggregate', board: SOURCE, source: SOURCE,\n  company: j.companyName ?? '',\n  title: j.jobTitle ?? '',\n  url: j.url ?? '',                               // jobicy.com link - satisfies their credit term\n  description_raw: j.jobDescription || j.jobExcerpt || '',\n  posted_raw: j.pubDate ?? '',\n  location: j.jobGeo ?? ''\n}}));\n\nconsole.log(`[${SOURCE}] ${out.length} jobs`);\nreturn [{ json: { _kind: 'source_status', source: SOURCE, tier: 'aggregate', status: 'ok', count: out.length } }, ...out];\n"
+      }
+    },
+    {
+      "id": "b6cb651b-52ff-4053-a6a6-16a7759572a4",
+      "name": "Merge All Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        400,
+        520
+      ],
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 6
+      }
+    },
+    {
+      "id": "30a2711c-d8d9-44a9-a67a-3fd8348264ae",
+      "name": "Normalize Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Six sources, six shapes, one schema. The Map nodes only rename fields;\n// this node does the cleaning that has to be identical for every source:\n//  - descriptions: decode entities and strip HTML. Greenhouse double-encodes\n//    (&lt;p&gt; inside JSON), so decode -> strip -> decode -> strip.\n//  - dates: ISO strings, \"YYYY-MM-DD HH:mm:ss\", unix seconds and unix\n//    milliseconds (sometimes as strings) all become YYYY-MM-DD, or null.\n//  - text fields: trimmed, whitespace collapsed.\n// Source-status items pass straight through for the Run Log.\n\nconst cfg = $('Build Config').first().json;\n\nconst NAMED = { amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\", nbsp: ' ', ndash: '-', mdash: '-',\n                hellip: '...', lsquo: \"'\", rsquo: \"'\", ldquo: '\"', rdquo: '\"', bull: '•', middot: '·',\n                copy: '©', reg: '®', trade: '™', eacute: 'é', egrave: 'è', uuml: 'ü', ouml: 'ö', auml: 'ä' };\nconst decode = (s) => String(s ?? '')\n  .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))\n  .replace(/&#(\\d+);/g, (_, n) => String.fromCodePoint(Number(n)))\n  .replace(/&([a-z]+);/gi, (m, name) => NAMED[name.toLowerCase()] ?? m);\nconst stripTags = (s) => s\n  .replace(/<(script|style)[^>]*>[\\s\\S]*?<\\/\\1>/gi, ' ')\n  .replace(/<[^>]+>/g, ' ');\nconst clean = (s) => stripTags(decode(stripTags(decode(s)))).replace(/\\s+/g, ' ').trim();\n\nconst now = Date.now();\nconst toIsoDate = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  let d;\n  const s = String(v).trim();\n  if (/^\\d{9,13}$/.test(s)) {                     // unix seconds (<1e12) or milliseconds\n    const n = Number(s);\n    d = new Date(n < 1e12 ? n * 1000 : n);\n  } else {\n    d = new Date(/^\\d{4}-\\d{2}-\\d{2} \\d/.test(s) ? s.replace(' ', 'T') : s);\n  }\n  if (isNaN(d.getTime())) return null;\n  // Reject obvious garbage: pre-2015 epochs from bad parsing, or the future.\n  if (d.getUTCFullYear() < 2015 || d.getTime() > now + 86400000) return null;\n  return d.toISOString().slice(0, 10);\n};\n\nconst all = $input.all().map(i => i.json);\nconst statuses = all.filter(r => r._kind === 'source_status');\nconst out = statuses.map(s => ({ json: s }));\nconst perSource = {};\n\nfor (const j of all) {\n  if (j._kind !== 'job') continue;\n  const description = clean(j.description_raw);\n  out.push({ json: {\n    _kind: 'job',\n    tier: j.tier,\n    board: j.board,\n    source: j.source,\n    company: String(j.company ?? '').replace(/\\s+/g, ' ').trim(),\n    title: clean(j.title),\n    url: String(j.url ?? '').trim(),\n    description,                                   // full cleaned text; trimmed for the sheet later\n    posted_date: toIsoDate(j.posted_raw),\n    location: clean(j.location)\n  }});\n  perSource[j.board] = (perSource[j.board] ?? 0) + 1;\n}\n\nconsole.log(`[normalize] ${out.length - statuses.length} jobs from ${statuses.length} sources | ` +\n            Object.entries(perSource).map(([k, v]) => `${k} ${v}`).join(', '));\nreturn out;\n"
+      }
+    },
+    {
+      "id": "9ca75c56-0860-46f0-a5b2-b40e3a04946e",
+      "name": "Filter, Rank & Cap",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Filters, in the order the brief specifies, each counted so the drop\n// breakdown tells you exactly where jobs went:\n//   required fields -> description length -> valid date -> age -> role\n//   -> location -> dedupe within run -> dedupe against Applications\n// Then rank (company boards first, newest first), apply the per-company and\n// per-run caps, and shape rows to the Applications header.\n//\n// Output is ONE item: { rows, stats }. Keeping the rows inside a single item\n// (instead of one item per row) means this node always emits something, even\n// on a zero-match run, so the If node can route that run straight to the\n// Run Log instead of the branch silently stopping.\n\nconst cfg = $('Build Config').first().json;\nconst sheet = $('Index Existing Rows').first().json;\nconst all = $input.all().map(i => i.json);\nconst statuses = all.filter(r => r._kind === 'source_status');\nconst jobs = all.filter(r => r._kind === 'job');\n\n// ---- matching helpers -------------------------------------------------\n// Whole-word match, case-insensitive, optional plural \"s\". Plain substring\n// matching is how 'intern' ends up excluding \"internal tools\" and 'india'\n// ends up blocking \"Indianapolis, Indiana\".\nconst esc = (s) => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\nconst wordRx = (terms) => terms.length\n  ? new RegExp(`(?<![a-z0-9])(?:${terms.map(t => esc(String(t).toLowerCase().trim())).join('|')})s?(?![a-z0-9])`, 'i')\n  : null;\nconst test = (rx, s) => !!rx && rx.test(s);\n\nconst roleRx = cfg.filters.map(f => ({ name: f.name, inc: wordRx(f.include ?? []), exc: wordRx(f.exclude ?? []) }));\nconst matchRole = (j) => {\n  const field = cfg.match_in === 'title_and_description' ? `${j.title} ${j.description}` : j.title;\n  // Excludes look at the same field as includes. Checking excludes against\n  // the description would drop any role that \"reports to the Director\".\n  for (const f of roleRx) if (test(f.inc, field) && !test(f.exc, field)) return f.name;\n  return null;\n};\n\nconst usRx = wordRx(cfg.location_us_explicit);\nconst blockRx = wordRx(cfg.location_block);\nconst allowRx = wordRx(cfg.location_allow);\nconst stateRx = cfg.us_state_codes.length\n  ? new RegExp(`,\\\\s*(?:${cfg.us_state_codes.join('|')})(?![A-Za-z])`)   // case-sensitive on purpose\n  : null;\nconst matchLocation = (loc) => {\n  if (!loc) return true;                          // unknown location: let it through\n  const segments = loc.split(/\\s*(?:;|\\||•|\\/|\\bor\\b|\\n)\\s*/i).filter(Boolean);\n  return segments.some(seg =>\n    test(usRx, seg) || (!test(blockRx, seg) && (test(allowRx, seg) || test(stateRx, seg))));\n};\n\n// ---- URL dedupe key -----------------------------------------------------\n// Lowercased host+path with \"www.\" and trailing slashes dropped, fragment\n// dropped, and only identity query params kept (cfg.url_id_params).\n// Applied identically to new jobs and to links already in Applications.\nconst idParams = new Set(cfg.url_id_params.map(p => p.toLowerCase()));\nconst urlKey = (u) => {\n  const raw = String(u ?? '').trim();\n  try {\n    const url = new URL(raw);\n    const kept = [...url.searchParams].filter(([k]) => idParams.has(k.toLowerCase()))\n      .map(([k, v]) => `${k.toLowerCase()}=${v}`).sort();\n    return `${url.hostname.replace(/^www\\./, '')}${url.pathname.replace(/\\/+$/, '')}${kept.length ? '?' + kept.join('&') : ''}`.toLowerCase();\n  } catch {\n    return raw.toLowerCase().replace(/#.*$/, '').replace(/\\/+$/, '');\n  }\n};\n\n// ---- filter pass --------------------------------------------------------\nconst existing = new Set(sheet.existing_links.map(urlKey));\nconst seen = new Set();\nconst dayMs = 86400000;\nconst today = Date.now();\nconst dropped = { missing_fields: 0, thin_description: 0, bad_date: 0, too_old: 0,\n                  no_role_match: 0, location_blocked: 0, duplicate_in_run: 0, already_in_sheet: 0 };\nconst matched = [];\n\nfor (const j of jobs) {\n  if (!j.title || !j.url || !j.company) { dropped.missing_fields++; continue; }\n  if (j.description.length < cfg.min_desc_len) { dropped.thin_description++; continue; }\n  if (!j.posted_date) { dropped.bad_date++; continue; }\n  const maxAge = cfg.max_age_days?.[j.tier];\n  if (maxAge != null && (today - Date.parse(j.posted_date + 'T00:00:00Z')) / dayMs > maxAge) { dropped.too_old++; continue; }\n  const role = matchRole(j);\n  if (!role) { dropped.no_role_match++; continue; }\n  if (!matchLocation(j.location)) { dropped.location_blocked++; continue; }\n  const key = urlKey(j.url);\n  if (seen.has(key)) { dropped.duplicate_in_run++; continue; }\n  seen.add(key);\n  if (existing.has(key)) { dropped.already_in_sheet++; continue; }\n  matched.push({ ...j, matched_filter: role });\n}\n\n// ---- rank and cap -------------------------------------------------------\n// Company boards first, then newest first; company name as a stable tiebreak.\nconst tierRank = (j) => (j.tier === 'company' ? 0 : 1);\nmatched.sort((a, b) => tierRank(a) - tierRank(b) || b.posted_date.localeCompare(a.posted_date) ||\n                       a.company.localeCompare(b.company));\n\n// Per-company cap. Jobs over the cap aren't lost: they're not in the sheet,\n// so they come back as candidates next run.\nconst perCompany = {};\nlet deferredCompanyCap = 0;\nconst capped = matched.filter(j => {\n  const k = j.company.toLowerCase();\n  perCompany[k] = (perCompany[k] ?? 0) + 1;\n  if (cfg.max_per_company && perCompany[k] > cfg.max_per_company) { deferredCompanyCap++; return false; }\n  return true;\n});\n\n// Run cap, optionally holding back slots for aggregate boards.\nconst agg = capped.filter(j => j.tier !== 'company');\nconst reserve = Math.min(cfg.min_aggregate_slots ?? 0, agg.length, cfg.max_results);\nconst companyTake = capped.filter(j => j.tier === 'company').slice(0, cfg.max_results - reserve);\nconst final = [...companyTake, ...agg.slice(0, cfg.max_results - companyTake.length)];\nconst deferredRunCap = capped.length - final.length;\n\n// ---- shape to the Applications header (exact, lowercase) ----------------------\nconst trimDesc = (s) => s.length > cfg.desc_max_chars\n  ? s.slice(0, cfg.desc_max_chars - 3).replace(/\\s+\\S*$/, '') + '...'\n  : s;\nconst rows = final.map((j, i) => ({\n  's.no': sheet.next_sno + i,\n  'company name': j.company,\n  'job posting link': j.url,\n  'job role': j.title,\n  'job description': trimDesc(j.description),\n  'day posted': j.posted_date,\n  'location': j.location || 'Not stated',\n  'matched filter': j.matched_filter,\n  'source': j.source,\n  'added on': cfg.run_date\n}));\n\nconst stats = {\n  collected: jobs.length,\n  matched: matched.length,\n  appending: rows.length,\n  deferred_company_cap: deferredCompanyCap,\n  deferred_run_cap: deferredRunCap,\n  dropped,\n  existing_row_count: sheet.existing_row_count,\n  sources: statuses\n};\n\nconsole.log(`[filter] collected ${jobs.length} | matched ${matched.length} | appending ${rows.length} | ` +\n            `deferred: ${deferredCompanyCap} over company cap, ${deferredRunCap} over run cap | ` +\n            `dropped ${JSON.stringify(dropped)}`);\n\nreturn [{ json: { rows, stats } }];\n"
+      }
+    },
+    {
+      "id": "fccbc8ce-42ec-49d2-a72a-4536982a9fb6",
+      "name": "Any New Jobs?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        520
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8f28ded3-600b-4aea-ae96-8c655680d4b7",
+              "leftValue": "={{ $json.rows.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f4384c73-3825-4454-a2e2-9d1c93a5d9cf",
+      "name": "Split Rows",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1380,
+        400
+      ],
+      "parameters": {
+        "fieldToSplitOut": "rows",
+        "include": "noOtherFields",
+        "options": {}
+      }
+    },
+    {
+      "id": "01b77144-9dec-4c3f-aa0b-c693bba31e02",
+      "name": "Append to Applications",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1600,
+        400
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Applications"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW",
+          "handlingExtraData": "error"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "45cb972b-7325-4385-a470-dcf6f2dbc6a9",
+      "name": "Build Run Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1860,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// One row per execution for the 'Run Log' tab: the health check you can read\n// without opening n8n. This node is reached by exactly one of two paths:\n//   - Append to Applications -> here           (there were new jobs)\n//   - Any New Jobs? (false) -> here      (zero new jobs - the run you most\n//                                         need logged, because \"nothing new\"\n//                                         and \"every board died\" look alike)\n// 'rows appended' is what the Sheets node actually returned, not what we\n// intended to write. Append to Applications continues on error, so a failed append\n// is reported here instead of killing the log too.\n\nconst cfg = $('Build Config').first().json;\nconst { rows, stats } = $('Filter, Rank & Cap').first().json;\n\nlet appended = 0;\nlet appendError = '';\nif ($('Append to Applications').isExecuted) {\n  const out = $('Append to Applications').all().map(i => i.json);\n  const err = out.find(r => r && r.error);\n  if (err) {\n    const e = err.error;\n    appendError = typeof e === 'string' ? e : (e?.message ?? 'unknown error');\n  } else {\n    appended = out.length;\n  }\n}\nconst written = appended ? rows.slice(0, appended) : [];\n\n// Count and render \"label (n); label (n)\" for the top entries.\nconst tally = (values, limit) => {\n  const c = {};\n  for (const v of values) c[v] = (c[v] ?? 0) + 1;\n  return Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, limit)\n    .map(([k, n]) => `${k} (${n})`).join('; ');\n};\n\nconst sources = stats.sources.filter(s => s.status !== 'disabled');\nconst okCount = sources.filter(s => s.status === 'ok').length;\nconst deadSources = sources.filter(s => s.status !== 'ok').map(s => s.source);\nif (appendError) deadSources.push(`Applications append FAILED: ${appendError.slice(0, 120)}`);\nconst deadBoards = sources.flatMap(s => (s.boards ?? []).filter(b => b.status !== 'ok')\n  .map(b => `${b.company} (${s.source}, ${b.reason})`));\n\nconst log = {\n  'run at': cfg.run_at,\n  'sources ok': `${okCount}/${sources.length}`,\n  'dead sources': deadSources.join('; ') || 'none',\n  'dead company boards': deadBoards.join('; ') || 'none',\n  'jobs collected': stats.collected,\n  'rows appended': appended,\n  'sheet total after run': stats.existing_row_count + appended,\n  // First segment only, so \"NYC | SF | Remote\" counts once, as NYC.\n  'top locations': tally(written.map(r => String(r.location).split(/\\s*[|;•]\\s*/)[0] || 'Not stated'), 8) || 'none',\n  'role breakdown': tally(written.map(r => r['matched filter']), 10) || 'none'\n};\n\nconsole.log(`[run log] ${log['sources ok']} sources ok | ${stats.collected} collected | ${appended} appended` +\n            (appendError ? ` | APPEND FAILED: ${appendError}` : ''));\nreturn [{ json: log }];\n"
+      }
+    },
+    {
+      "id": "dca84129-4bc9-4093-a544-63a93aa55ef7",
+      "name": "Append to Run Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2080,
+        660
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Run Log"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW",
+          "handlingExtraData": "error"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 3 Days": {
+      "main": [
+        [
+          {
+            "node": "Build Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Config": {
+      "main": [
+        [
+          {
+            "node": "Read Applications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Applications": {
+      "main": [
+        [
+          {
+            "node": "Index Existing Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Index Existing Rows": {
+      "main": [
+        [
+          {
+            "node": "Greenhouse Targets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Ashby Targets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Lever Targets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Remotive API",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RemoteOK API",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Jobicy API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Greenhouse Targets": {
+      "main": [
+        [
+          {
+            "node": "Greenhouse Boards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Greenhouse Boards": {
+      "main": [
+        [
+          {
+            "node": "Map Greenhouse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ashby Targets": {
+      "main": [
+        [
+          {
+            "node": "Ashby Boards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ashby Boards": {
+      "main": [
+        [
+          {
+            "node": "Map Ashby",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lever Targets": {
+      "main": [
+        [
+          {
+            "node": "Lever Boards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lever Boards": {
+      "main": [
+        [
+          {
+            "node": "Map Lever",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remotive API": {
+      "main": [
+        [
+          {
+            "node": "Map Remotive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RemoteOK API": {
+      "main": [
+        [
+          {
+            "node": "Map RemoteOK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jobicy API": {
+      "main": [
+        [
+          {
+            "node": "Map Jobicy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Greenhouse": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Ashby": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Map Lever": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Map Remotive": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Map RemoteOK": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "Map Jobicy": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      ]
+    },
+    "Merge All Sources": {
+      "main": [
+        [
+          {
+            "node": "Normalize Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Jobs": {
+      "main": [
+        [
+          {
+            "node": "Filter, Rank & Cap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter, Rank & Cap": {
+      "main": [
+        [
+          {
+            "node": "Any New Jobs?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any New Jobs?": {
+      "main": [
+        [
+          {
+            "node": "Split Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Rows": {
+      "main": [
+        [
+          {
+            "node": "Append to Applications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append to Applications": {
+      "main": [
+        [
+          {
+            "node": "Build Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Log": {
+      "main": [
+        [
+          {
+            "node": "Append to Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York",
+    "saveManualExecutions": true
+  }
+}
